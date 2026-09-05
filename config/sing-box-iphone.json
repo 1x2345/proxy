@@ -1,0 +1,132 @@
+{
+  "$schema": "https://sing-box.sagernet.org/schema.json",
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "https",
+        "tag": "dns-direct",
+        "server": "223.5.5.5",
+        "tls": {
+          "server_name": "dns.alidns.com"
+        }
+      },
+      {
+        "type": "https",
+        "tag": "dns-proxy",
+        "server": "8.8.8.8",
+        "tls": {
+          "server_name": "dns.google"
+        },
+        "detour": "select"
+      }
+    ],
+    "rules": [
+      {
+        "rule_set": "geosite-apple",
+        "server": "dns-direct"
+      }
+    ],
+    "final": "dns-proxy",
+    "strategy": "prefer_ipv4",
+    "cache_capacity": 1024
+  },
+  "http_clients": [
+    {
+      "tag": "rule-set-direct",
+      "domain_resolver": "dns-direct"
+    }
+  ],
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "address": [
+        "172.19.0.1/30",
+        "fdfe:dcba:9876::1/126"
+      ],
+      "mtu": 1400,
+      "auto_route": true,
+      "udp_timeout": "1m",
+      "udp_nat_max": 256,
+      "stack": "system"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "selector",
+      "tag": "select",
+      "outbounds": [
+        "Singapore",
+        "direct"
+      ]
+    },
+    {
+      "type": "snell",
+      "tag": "Singapore",
+      "server": "xxxxxx",
+      "server_port": 443,
+      "version": 6,
+      "psk": "xxxxxx"
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "action": "sniff",
+        "sniffer": [
+          "http",
+          "tls",
+          "quic",
+          "dns"
+        ]
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "rule_set": [
+          "geoip-cn",
+          "geosite-apple"
+        ],
+        "outbound": "direct"
+      }
+    ],
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "geoip-cn",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/{tag}.srs",
+        "http_client": "rule-set-direct",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "geosite-apple",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/{tag}.srs",
+        "http_client": "rule-set-direct",
+        "update_interval": "1d"
+      }
+    ],
+    "final": "select",
+    "auto_detect_interface": true,
+    "default_domain_resolver": "dns-direct"
+  },
+  "experimental": {
+    "cache_file": {
+      "enabled": true
+    }
+  }
+}
