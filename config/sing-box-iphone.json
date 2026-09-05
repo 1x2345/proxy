@@ -31,7 +31,6 @@
       }
     ],
     "final": "dns-proxy",
-    "strategy": "prefer_ipv6",
     "cache_capacity": 1024
   },
   "http_clients": [
@@ -74,11 +73,7 @@
     },
     {
       "type": "direct",
-      "tag": "direct",
-      "domain_resolver": {
-        "server": "dns-direct",
-        "strategy": "prefer_ipv6"
-      }
+      "tag": "direct"
     }
   ],
   "route": {
