@@ -532,8 +532,9 @@ ip_line() {
   command -v curl >/dev/null 2>&1 || { IP_LINE='-'; printf '-'; return; }
   f4=$(mktemp) || { IP_LINE='-'; printf '-'; return; }
   f6=$(mktemp) || { rm -f "$f4"; IP_LINE='-'; printf '-'; return; }
-  (curl -4 -fsS --connect-timeout 1 --max-time 2 https://api.ip.sb/ip 2>/dev/null || true) >"$f4" &
-  (curl -6 -fsS --connect-timeout 1 --max-time 2 https://api64.ipify.org 2>/dev/null || true) >"$f6" &
+  # 复用 curl_ip 多源回退，双栈并行
+  (curl_ip 4 >"$f4" || true) &
+  (curl_ip 6 >"$f6" || true) &
   wait
   v4=$(tr -d ' \t\r\n' <"$f4")
   v6=$(tr -d ' \t\r\n' <"$f6")
@@ -732,6 +733,12 @@ make_tls_cert() {
   printf '%s' "$d"
 }
 
+ensure_gcompat() {
+  [[ "$OS_KIND" == alpine ]] || return 0
+  command -v gcompat >/dev/null 2>&1 && return 0
+  apk add --no-cache gcompat >/dev/null 2>&1 || true
+}
+
 goarch() {
   case "$(uname -m)" in
     x86_64|amd64)  printf 'amd64' ;;
@@ -828,9 +835,7 @@ install_singbox() {
     err "压缩包里没有 sing-box 二进制"
     return 1
   fi
-  if [[ "$OS_KIND" == alpine ]] && ! command -v gcompat >/dev/null 2>&1; then
-    apk add --no-cache gcompat >/dev/null 2>&1 || true
-  fi
+  ensure_gcompat
   mkdir -p /usr/local/bin
   if ! install -m 0755 "$bin" "$SBOX_BIN"; then
     rm -rf "$tmp"
@@ -839,9 +844,7 @@ install_singbox() {
   fi
   rm -rf "$tmp"
   if ! "$SBOX_BIN" version >/dev/null 2>&1; then
-    if [[ "$OS_KIND" == alpine ]]; then
-      apk add --no-cache gcompat >/dev/null 2>&1 || true
-    fi
+    ensure_gcompat
     "$SBOX_BIN" version >/dev/null 2>&1 || { err "sing-box 无法执行"; return 1; }
   fi
   ensure_conf
@@ -905,15 +908,43 @@ RC
   fi
 }
 
+# 统一 debian systemd / alpine openrc 启停
+svc_do() {
+  local op=$1
+  if [[ "$OS_KIND" == debian ]]; then
+    case "$op" in
+      start) systemctl start sing-box ;;
+      stop) systemctl stop sing-box 2>/dev/null || true ;;
+      restart)
+        systemctl reset-failed sing-box 2>/dev/null || true
+        systemctl restart sing-box
+        ;;
+      logs) journalctl -u sing-box -n 30 --no-pager 2>/dev/null || true ;;
+      purge)
+        systemctl disable sing-box >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/sing-box.service
+        systemctl daemon-reload
+        ;;
+    esac
+  else
+    case "$op" in
+      start) rc-service sing-box start ;;
+      stop) rc-service sing-box stop 2>/dev/null || true ;;
+      restart) rc-service sing-box restart 2>/dev/null || rc-service sing-box start ;;
+      logs) tail -n 30 "$LOG_FILE" 2>/dev/null || true ;;
+      purge)
+        rc-update del sing-box default >/dev/null 2>&1 || true
+        rm -f /etc/init.d/sing-box
+        ;;
+    esac
+  fi
+}
+
 svc_start() {
   need_bin || return 1
   ensure_conf
   [[ "$(svc_state)" == absent ]] && install_service
-  if [[ "$OS_KIND" == debian ]]; then
-    systemctl start sing-box
-  else
-    rc-service sing-box start
-  fi
+  svc_do start
   sleep 0.15
   if [[ "$(svc_state)" != running ]]; then
     err "启动失败"
@@ -927,11 +958,7 @@ svc_stop() {
     return 1
   fi
   [[ "$(svc_state)" == absent ]] && return 0
-  if [[ "$OS_KIND" == debian ]]; then
-    systemctl stop sing-box 2>/dev/null || true
-  else
-    rc-service sing-box stop 2>/dev/null || true
-  fi
+  svc_do stop
   if [[ "$(svc_state)" == running ]]; then
     err "停止失败"
     return 1
@@ -941,23 +968,14 @@ svc_stop() {
 svc_restart() {
   need_bin || return 1
   [[ "$(svc_state)" == absent ]] && install_service
-  if [[ "$OS_KIND" == debian ]]; then
-    systemctl reset-failed sing-box 2>/dev/null || true
-    systemctl restart sing-box
-  else
-    rc-service sing-box restart 2>/dev/null || rc-service sing-box start
-  fi
+  svc_do restart
   sleep 0.15
   if [[ "$(svc_state)" == running ]]; then
     [[ -n "${QUIET:-}" ]] || ok "服务已启动"
   else
     if [[ -z "${QUIET:-}" ]]; then
       err "服务没起来，最近日志："
-      if [[ "$OS_KIND" == debian ]]; then
-        journalctl -u sing-box -n 30 --no-pager 2>/dev/null || true
-      else
-        tail -n 30 "$LOG_FILE" 2>/dev/null || true
-      fi
+      svc_do logs
     fi
     return 1
   fi
@@ -1076,13 +1094,9 @@ add_ss() {
       '{type:"shadowsocks", tag:$tag, method:"2022-blake3-aes-128-gcm", password:$pass}')
     conf_add_inbound "$st" || return 1
     conf_add_inbound "$ss" || { drop_node "$tag"; return 1; }
-    meta_put_node "$tag" "$(jq -n \
+    node_commit "$tag" "ss+st :$port" "$(jq -n \
       --arg name "$tag" --argjson port "$port" --arg inner "$inner" --arg hs "$hs" \
-      '{kind:"shadowsocks", plugin:"shadowtls", name:$name, port:$port, inner_tag:$inner, handshake:$hs}')" \
-      || { drop_node "$tag"; return 1; }
-    apply_conf "$tag" || return 1
-    ok "ss+st :$port"
-    show_share "$tag"
+      '{kind:"shadowsocks", plugin:"shadowtls", name:$name, port:$port, inner_tag:$inner, handshake:$hs}')"
     return
   fi
   tag="ss-$port"
@@ -1094,11 +1108,8 @@ add_ss() {
       multiplex:{enabled:true, padding:true}
     }')
   conf_add_inbound "$obj" || return 1
-  meta_put_node "$tag" "$(jq -n --arg name "$tag" --argjson port "$port" \
-    '{kind:"shadowsocks", name:$name, port:$port}')" || { drop_node "$tag"; return 1; }
-  apply_conf "$tag" || return 1
-  ok "ss :$port"
-  show_share "$tag"
+  node_commit "$tag" "ss :$port" "$(jq -n --arg name "$tag" --argjson port "$port" \
+    '{kind:"shadowsocks", name:$name, port:$port}')"
 }
 
 add_vless() {
@@ -1130,18 +1141,14 @@ add_vless() {
       }
     }')
   conf_add_inbound "$obj" || return 1
-  meta_put_node "$tag" "$(jq -n \
-    --arg name "$tag" --argjson port "$port" --arg sni "$sni" \
-    --arg pbk "$pub" --arg sid "$sid" --arg uuid "$uuid" \
-    '{kind:"vless", name:$name, port:$port, sni:$sni, public_key:$pbk, short_id:$sid, uuid:$uuid}')" \
-    || { drop_node "$tag"; return 1; }
-  keys_put "$tag" "$(jq -n \
-    --arg pbk "$pub" --arg sid "$sid" --arg sni "$sni" --arg uuid "$uuid" \
-    '{public_key:$pbk, short_id:$sid, sni:$sni, uuid:$uuid}')" \
-    || { drop_node "$tag"; return 1; }
-  apply_conf "$tag" || return 1
-  ok "vless :$port"
-  show_share "$tag"
+  node_commit "$tag" "vless :$port" \
+    "$(jq -n \
+      --arg name "$tag" --argjson port "$port" --arg sni "$sni" \
+      --arg pbk "$pub" --arg sid "$sid" --arg uuid "$uuid" \
+      '{kind:"vless", name:$name, port:$port, sni:$sni, public_key:$pbk, short_id:$sid, uuid:$uuid}')" \
+    "$(jq -n \
+      --arg pbk "$pub" --arg sid "$sid" --arg sni "$sni" --arg uuid "$uuid" \
+      '{public_key:$pbk, short_id:$sid, sni:$sni, uuid:$uuid}')"
 }
 
 add_vmess() {
@@ -1157,12 +1164,8 @@ add_vmess() {
       users:[{name:"default", uuid:$uuid, alterId:0}]
     }')
   conf_add_inbound "$obj" || return 1
-  meta_put_node "$tag" "$(jq -n --arg name "$tag" --argjson port "$port" --arg uuid "$uuid" \
-    '{kind:"vmess", name:$name, port:$port, uuid:$uuid}')" \
-    || { drop_node "$tag"; return 1; }
-  apply_conf "$tag" || return 1
-  ok "vmess :$port"
-  show_share "$tag"
+  node_commit "$tag" "vmess :$port" "$(jq -n --arg name "$tag" --argjson port "$port" --arg uuid "$uuid" \
+    '{kind:"vmess", name:$name, port:$port, uuid:$uuid}')"
 }
 
 add_hy2() {
@@ -1186,13 +1189,9 @@ add_hy2() {
       masquerade:{type:"string", status_code:200, content:"OK"}
     }')
   conf_add_inbound "$obj" || return 1
-  meta_put_node "$tag" "$(jq -n \
+  node_commit "$tag" "hy2 :$port" "$(jq -n \
     --arg name "$tag" --argjson port "$port" --arg sni "$sni" \
-    '{kind:"hysteria2", name:$name, port:$port, sni:$sni, insecure:"1"}')" \
-    || { drop_node "$tag"; return 1; }
-  apply_conf "$tag" || return 1
-  ok "hy2 :$port"
-  show_share "$tag"
+    '{kind:"hysteria2", name:$name, port:$port, sni:$sni, insecure:"1"}')"
 }
 
 add_anytls() {
@@ -1213,13 +1212,9 @@ add_anytls() {
       tls:{enabled:true, server_name:$sni, alpn:["h2","http/1.1"], certificate_path:$cert, key_path:$key}
     }')
   conf_add_inbound "$obj" || return 1
-  meta_put_node "$tag" "$(jq -n \
+  node_commit "$tag" "anytls :$port" "$(jq -n \
     --arg name "$tag" --argjson port "$port" --arg sni "$sni" \
-    '{kind:"anytls", name:$name, port:$port, sni:$sni, insecure:"1"}')" \
-    || { drop_node "$tag"; return 1; }
-  apply_conf "$tag" || return 1
-  ok "anytls :$port"
-  show_share "$tag"
+    '{kind:"anytls", name:$name, port:$port, sni:$sni, insecure:"1"}')"
 }
 
 add_snell() {
@@ -1236,13 +1231,9 @@ add_snell() {
       version:6, psk:$psk, mode:"default"
     }')
   conf_add_inbound "$obj" || return 1
-  meta_put_node "$tag" "$(jq -n \
+  node_commit "$tag" "snell :$port" "$(jq -n \
     --arg name "$tag" --argjson port "$port" \
-    '{kind:"snell", name:$name, port:$port, mode:"default"}')" \
-    || { drop_node "$tag"; return 1; }
-  apply_conf "$tag" || return 1
-  ok "snell :$port"
-  show_share "$tag"
+    '{kind:"snell", name:$name, port:$port, mode:"default"}')"
 }
 
 del_node() {
@@ -1283,6 +1274,27 @@ show_block() {
   printf '%s\n' "$body" | sed 's/^/  /'
 }
 
+# uri/surge 可空；按需输出 URI → Surge → Clash → sing-box
+show_share_parts() {
+  local uri=${1-} yaml=${2-} json=${3-} surge=${4-}
+  [[ -n "$uri" ]] && show_block "URI" "$uri"
+  [[ -n "$surge" ]] && show_block "Surge" "$surge"
+  [[ -n "$yaml" ]] && show_block "Clash" "$yaml"
+  [[ -n "$json" ]] && show_block "sing-box" "$json"
+}
+
+# inbound 已写入后：meta → keys? → apply → 分享
+node_commit() {
+  local tag=$1 label=$2 meta_json=$3 keys_json=${4-}
+  meta_put_node "$tag" "$meta_json" || { drop_node "$tag"; return 1; }
+  if [[ -n "$keys_json" ]]; then
+    keys_put "$tag" "$keys_json" || { drop_node "$tag"; return 1; }
+  fi
+  apply_conf "$tag" || return 1
+  ok "$label"
+  show_share "$tag"
+}
+
 share_ss() {
   local tag=$1 host=$2
   local port method pass name uri yaml json
@@ -1303,9 +1315,7 @@ share_ss() {
   json=$(jq -n --arg tag "$name" --arg host "$host" --argjson port "$port" \
     --arg method "$method" --arg pass "$pass" \
     '{type:"shadowsocks", tag:$tag, server:$host, server_port:$port, method:$method, password:$pass, multiplex:{enabled:true, padding:true}}')
-  show_block "URI" "$uri"
-  show_block "Clash" "$yaml"
-  show_block "sing-box" "$json"
+  show_share_parts "$uri" "$yaml" "$json"
 }
 
 share_st() {
@@ -1349,8 +1359,7 @@ share_st() {
         tls:{enabled:true, server_name:$hs, utls:{enabled:true, fingerprint:"chrome"}}
       }
     ]')
-  show_block "Clash" "$yaml"
-  show_block "sing-box" "$json"
+  show_share_parts "" "$yaml" "$json"
 }
 
 share_vless() {
@@ -1396,9 +1405,7 @@ share_vless() {
         reality:{enabled:true, public_key:$pbk, short_id:$sid}
       }
     }')
-  show_block "URI" "$uri"
-  show_block "Clash" "$yaml"
-  show_block "sing-box" "$json"
+  show_share_parts "$uri" "$yaml" "$json"
 }
 
 share_vmess() {
@@ -1423,9 +1430,7 @@ share_vmess() {
     "  udp: true")
   json=$(jq -n --arg tag "$name" --arg host "$host" --argjson port "$port" --arg uuid "$uuid" \
     '{type:"vmess", tag:$tag, server:$host, server_port:$port, uuid:$uuid, security:"auto", alter_id:0}')
-  show_block "URI" "$uri"
-  show_block "Clash" "$yaml"
-  show_block "sing-box" "$json"
+  show_share_parts "$uri" "$yaml" "$json"
 }
 
 share_hy2() {
@@ -1456,9 +1461,7 @@ share_hy2() {
       type:"hysteria2", tag:$tag, server:$host, server_port:$port, password:$pass,
       tls:{enabled:true, server_name:$sni, insecure:true}
     } + (if ($opw == "" or $opw == "null") then {} else {obfs:{type:"salamander", password:$opw}} end)')
-  show_block "URI" "$uri"
-  show_block "Clash" "$yaml"
-  show_block "sing-box" "$json"
+  show_share_parts "$uri" "$yaml" "$json"
 }
 
 share_anytls() {
@@ -1485,9 +1488,7 @@ share_anytls() {
       type:"anytls", tag:$tag, server:$host, server_port:$port, password:$pass,
       tls:{enabled:true, server_name:$sni, insecure:true, utls:{enabled:true, fingerprint:"chrome"}}
     }')
-  show_block "URI" "$uri"
-  show_block "Clash" "$yaml"
-  show_block "sing-box" "$json"
+  show_share_parts "$uri" "$yaml" "$json"
 }
 
 share_snell() {
@@ -1510,9 +1511,7 @@ share_snell() {
   json=$(jq -n --arg tag "$name" --arg host "$host" --argjson port "$port" \
     --arg psk "$psk" --arg mode "$mode" \
     '{type:"snell", tag:$tag, server:$host, server_port:$port, version:6, psk:$psk, mode:$mode}')
-  show_block "Surge" "$surge"
-  show_block "Clash" "$yaml"
-  show_block "sing-box" "$json"
+  show_share_parts "" "$yaml" "$json" "$surge"
 }
 
 show_share() {
@@ -1549,14 +1548,7 @@ uninstall_all() {
   fi
   ask_yn "卸载内核、服务和全部配置？" n || return 2
   [[ "$(svc_state)" != absent ]] && svc_stop || true
-  if [[ "$OS_KIND" == debian ]]; then
-    systemctl disable sing-box >/dev/null 2>&1 || true
-    rm -f /etc/systemd/system/sing-box.service
-    systemctl daemon-reload
-  else
-    rc-update del sing-box default >/dev/null 2>&1 || true
-    rm -f /etc/init.d/sing-box
-  fi
+  svc_do purge || true
   rm -f "$SBOX_BIN" "$SBOX_SELF"
   rm -rf "$CONF_DIR"
   CACHE_SBVER="" CACHE_SBVER_MT="" CACHE_NC="" CACHE_NC_MT="" IP_LINE=""
