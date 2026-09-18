@@ -192,14 +192,27 @@ ui_menu_widths() {
 }
 
 ui_render() {
-  local cols=${1:-4} i n m w1=8 w2=8
-  local BOX r c idx text rows maxw val line=1 cw rowtxt content hw1 hw2
+  local cols=${1:-4} i n m w1=4 w2=4
+  local BOX r c idx text rows maxw val line=1 cw rowtxt content hw1 hw2 dw need_box
   n=${#UI_IK[@]}
   m=${#UI_MK[@]}
   maxw=$(term_cols)
   (( maxw < 36 )) && maxw=36
-  BOX=$maxw
-  (( BOX > 48 )) && BOX=48
+
+  # 项目列 / 配置列：按实际内容量宽，避免内存/磁盘单位被截成 Mi/Gi
+  for ((i=0;i<n;i++)); do
+    dw=$(disp_w "${UI_IK[i]}")
+    (( dw > w1 )) && w1=$dw
+    dw=$(disp_w "${UI_IV[i]}")
+    (( dw > w2 )) && w2=$dw
+  done
+  (( w1 < 4 )) && w1=4
+  (( w2 < 4 )) && w2=4
+  # 边框：| sp w1 sp | sp w2 sp | ≈ 7 + w1 + w2
+  need_box=$((7 + w1 + w2))
+
+  BOX=$need_box
+  (( BOX < 37 )) && BOX=37
   if (( m > 0 )); then
     ui_menu_widths "$cols"
     if (( MENU_DW > maxw && cols > 2 )); then
@@ -207,15 +220,27 @@ ui_render() {
       ui_menu_widths "$cols"
     fi
     (( MENU_DW > BOX )) && BOX=$MENU_DW
-    (( BOX > maxw )) && BOX=$maxw
   fi
   if (( BOX < 37 && cols > 2 )); then
     cols=2
     (( m > 0 )) && ui_menu_widths "$cols"
   fi
-  w1=8
-  w2=$(( BOX - 7 - w1 ))
-  (( w2 < 4 )) && w2=4
+  # 完整单位优先：允许为信息栏略超终端宽；极端长值才回落到 maxw 并截断
+  if (( BOX > maxw )); then
+    if (( need_box <= maxw )); then
+      BOX=$maxw
+    elif (( need_box <= maxw + 24 )); then
+      BOX=$need_box
+    else
+      BOX=$maxw
+      w2=$(( BOX - 7 - w1 ))
+      (( w2 < 4 )) && w2=4
+    fi
+  fi
+  # 菜单撑得更宽时，配置列吃掉多余宽度
+  if (( BOX - 7 - w1 > w2 )); then
+    w2=$(( BOX - 7 - w1 ))
+  fi
   hw1=$((w1 + 2))
   hw2=$((w2 + 2))
   line=1
@@ -400,17 +425,16 @@ disk_nums() {
 }
 
 cap_lines() {
-  local mt mu ma dt du da wt wu wa d
+  local mt mu ma dt du da wt wu d
   read -r mt mu ma <<< "$(mem_nums)"
   read -r dt du da <<< "$(disk_nums)"
   wt=$(disp_w "$mt"); d=$(disp_w "$dt"); (( d > wt )) && wt=$d
   wu=$(disp_w "$mu"); d=$(disp_w "$du"); (( d > wu )) && wu=$d
-  wa=$(disp_w "$ma"); d=$(disp_w "$da"); (( d > wa )) && wa=$d
   (( wt < 4 )) && wt=4
   (( wu < 4 )) && wu=4
-  (( wa < 4 )) && wa=4
-  CAP_MEM="总$(pad_r "$mt" "$wt")  已$(pad_r "$mu" "$wu")  剩$(pad_r "$ma" "$wa")"
-  CAP_DISK="总$(pad_r "$dt" "$wt")  已$(pad_r "$du" "$wu")  剩$(pad_r "$da" "$wa")"
+  # 总/已 右对齐；剩 不 pad，避免尾部空格把单位挤出信息列
+  CAP_MEM="总$(pad_r "$mt" "$wt")  已$(pad_r "$mu" "$wu")  剩${ma}"
+  CAP_DISK="总$(pad_r "$dt" "$wt")  已$(pad_r "$du" "$wu")  剩${da}"
 }
 
 cpu_line() {
