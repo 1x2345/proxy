@@ -67,7 +67,7 @@ jq_write() {
   local file=$1 tmp rc=0
   shift
   tmp=$(mktemp) || return 1
-  if jq "$@" "$file" > "$tmp"; then
+  if jq "$@" "$file" > "$tmp" && [[ -s "$tmp" ]]; then
     mv "$tmp" "$file" || rc=1
   else
     rc=1
@@ -339,7 +339,7 @@ ensure_deps() {
   done
   command -v ss >/dev/null 2>&1 || need+=(iproute2)
   if ((${#need[@]})); then
-    pkg_install "${need[@]}" ca-certificates || die "依赖安装失败"
+    pkg_install "${need[@]}" ca-certificates || { err "依赖安装失败"; return 1; }
   fi
 }
 
@@ -452,25 +452,35 @@ node_count() {
     printf '%s' "$CACHE_NC"
     return
   fi
-  CACHE_NC=$(jq '[.inbounds[]? | select((.tag // "") | startswith("ss-inner-") | not)] | length' "$CONF" 2>/dev/null || printf '0')
+  if ! command -v jq >/dev/null 2>&1; then
+    CACHE_NC=0
+  else
+    CACHE_NC=$(jq '[.inbounds[]? | select((.tag // "") | startswith("ss-inner-") | not)] | length' "$CONF" 2>/dev/null || printf '0')
+  fi
   CACHE_NC_MT=$mt
   printf '%s' "$CACHE_NC"
 }
 
+is_ip4() { [[ "${1-}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; }
+is_ip6() { [[ "${1-}" == *:* && "${1-}" != *[[:space:]]* ]]; }
+
 curl_ip() {
   local fam=$1 ip
   if [[ "$fam" == 6 ]]; then
-    ip=$(curl -6 -fsS --max-time 3 https://api64.ipify.org 2>/dev/null \
-      || curl -6 -fsS --max-time 3 https://ifconfig.me 2>/dev/null \
-      || curl -6 -fsS --max-time 3 https://icanhazip.com 2>/dev/null \
+    ip=$(curl -6 -fsS --connect-timeout 1 --max-time 2 https://api64.ipify.org 2>/dev/null \
+      || curl -6 -fsS --connect-timeout 1 --max-time 2 https://ifconfig.me 2>/dev/null \
+      || curl -6 -fsS --connect-timeout 1 --max-time 2 https://icanhazip.com 2>/dev/null \
       || true)
   else
-    ip=$(curl -4 -fsS --max-time 3 https://api.ip.sb/ip 2>/dev/null \
-      || curl -4 -fsS --max-time 3 https://ifconfig.me 2>/dev/null \
-      || curl -4 -fsS --max-time 3 https://icanhazip.com 2>/dev/null \
+    ip=$(curl -4 -fsS --connect-timeout 1 --max-time 2 https://api.ip.sb/ip 2>/dev/null \
+      || curl -4 -fsS --connect-timeout 1 --max-time 2 https://ifconfig.me 2>/dev/null \
+      || curl -4 -fsS --connect-timeout 1 --max-time 2 https://icanhazip.com 2>/dev/null \
       || true)
   fi
-  printf '%s' "$(printf '%s' "$ip" | tr -d ' \r\n')"
+  ip=$(printf '%s' "$ip" | tr -d ' \r\n')
+  if [[ "$fam" == 6 ]]; then is_ip6 "$ip" && printf '%s' "$ip"
+  else is_ip4 "$ip" && printf '%s' "$ip"
+  fi
 }
 
 iface_ip4() {
@@ -484,41 +494,36 @@ iface_ip6() {
 
 share_host() {
   local h=""
-  [[ -f "$META" ]] && h=$(jq -r '.share_host // .public_ip // empty' "$META" 2>/dev/null || true)
+  h=$(curl_ip 4)
+  [[ -z "$h" ]] && h=$(curl_ip 6)
   [[ -z "$h" ]] && h=$(iface_ip4)
+  [[ -z "$h" ]] && h=$(iface_ip6)
   printf '%s' "$h"
 }
 
 ip_line() {
-  local v4="" v6=""
-  if [[ -n "${CACHE_IP:-}" ]]; then
-    printf '%s' "$CACHE_IP"
+  local v4="" v6="" f4 f6
+  if [[ -n "${IP_LINE:-}" ]]; then
+    printf '%s' "$IP_LINE"
     return
   fi
-  if [[ -f "$META" ]]; then
-    { read -r v4; read -r v6; } < <(jq -r '.public_ip // empty, .public_ip6 // empty' "$META" 2>/dev/null)
+  command -v curl >/dev/null 2>&1 || { IP_LINE='-'; printf '-'; return; }
+  f4=$(mktemp) || { IP_LINE='-'; printf '-'; return; }
+  f6=$(mktemp) || { rm -f "$f4"; IP_LINE='-'; printf '-'; return; }
+  (curl -4 -fsS --connect-timeout 1 --max-time 2 https://api.ip.sb/ip 2>/dev/null || true) >"$f4" &
+  (curl -6 -fsS --connect-timeout 1 --max-time 2 https://api64.ipify.org 2>/dev/null || true) >"$f6" &
+  wait
+  v4=$(tr -d ' \t\r\n' <"$f4")
+  v6=$(tr -d ' \t\r\n' <"$f6")
+  rm -f "$f4" "$f6"
+  is_ip4 "$v4" || v4=""
+  is_ip6 "$v6" || v6=""
+  if [[ -n "$v4" && -n "$v6" ]]; then IP_LINE="$v4 $v6"
+  elif [[ -n "$v4" ]]; then IP_LINE="$v4"
+  elif [[ -n "$v6" ]]; then IP_LINE="$v6"
+  else IP_LINE="-"
   fi
-  [[ -z "$v4" ]] && v4=$(iface_ip4)
-  [[ -z "$v6" ]] && v6=$(iface_ip6)
-  if [[ -n "$v4" && -n "$v6" ]]; then CACHE_IP="$v4 $v6"
-  elif [[ -n "$v4" ]]; then CACHE_IP="$v4"
-  elif [[ -n "$v6" ]]; then CACHE_IP="$v6"
-  else CACHE_IP="-"
-  fi
-  printf '%s' "$CACHE_IP"
-}
-
-refresh_public_ip() {
-  local v4 v6
-  ensure_conf
-  v4=$(curl_ip 4)
-  [[ -z "$v4" ]] && v4=$(iface_ip4)
-  v6=$(curl_ip 6)
-  [[ -z "$v6" ]] && v6=$(iface_ip6)
-  [[ -n "$v4" || -n "$v6" ]] || return 1
-  CACHE_IP=""
-  jq_write "$META" --arg v4 "$v4" --arg v6 "$v6" \
-    '.public_ip=$v4 | .public_ip6=$v6 | if .share_host=="" then .share_host=(if $v4!="" then $v4 else $v6 end) else . end'
+  printf '%s' "$IP_LINE"
 }
 
 rand_str() { openssl rand -base64 "$1" | tr -d '/+=' | head -c "$2"; }
@@ -616,9 +621,6 @@ JSON
     cat > "$META" <<'JSON'
 {
   "version": 1,
-  "public_ip": "",
-  "public_ip6": "",
-  "share_host": "",
   "nodes": {}
 }
 JSON
@@ -772,6 +774,8 @@ verify_tarball() {
 
 install_singbox() {
   local tag ver arch url tmp bin name had
+  note "检查依赖…"
+  ensure_deps || return 1
   note "获取稳定版号…"
   tag=$(stable_tag)
   ver="${tag#v}"
@@ -819,7 +823,6 @@ install_singbox() {
     "$SBOX_BIN" version >/dev/null 2>&1 || { err "sing-box 无法执行"; return 1; }
   fi
   ensure_conf
-  refresh_public_ip || true
   had=$(svc_state)
   install_service
   install_self
@@ -1334,12 +1337,10 @@ share_vless() {
   port=$(ib_get "$tag" '.listen_port')
   uuid=$(ib_get "$tag" '.users[0].uuid')
   sni=$(keys_get "$tag" sni)
-  [[ -z "$sni" ]] && sni=$(jq -r --arg t "$tag" '.nodes[$t].sni // empty' "$META")
   [[ -z "$sni" ]] && sni=$(ib_get "$tag" '.tls.server_name')
   pbk=$(keys_get "$tag" public_key)
   [[ -z "$pbk" ]] && pbk=$(jq -r --arg t "$tag" '.nodes[$t].public_key // empty' "$META")
   sid=$(keys_get "$tag" short_id)
-  [[ -z "$sid" ]] && sid=$(jq -r --arg t "$tag" '.nodes[$t].short_id // empty' "$META")
   [[ -z "$sid" ]] && sid=$(ib_get "$tag" '.tls.reality.short_id[0]')
   name=$(node_name "$tag")
   if [[ -z "$pbk" ]]; then
@@ -1504,8 +1505,6 @@ show_share() {
   if [[ -z "$host" ]]; then
     ip=$(prompt "分享地址（域名或 IP）" "")
     [[ -n "$ip" ]] || { err "没有分享地址"; return 1; }
-    ensure_conf
-    jq_write "$META" --arg h "$ip" '.share_host=$h | .public_ip=$h' || return 1
     host=$ip
   fi
   typ=$(ib_get "$tag" '.type')
@@ -1527,7 +1526,7 @@ uninstall_all() {
     return 1
   fi
   ask_yn "卸载内核、服务和全部配置？" n || return 2
-  svc_stop
+  [[ "$(svc_state)" != absent ]] && svc_stop || true
   if [[ "$OS_KIND" == debian ]]; then
     systemctl disable sing-box >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/sing-box.service
@@ -1538,7 +1537,7 @@ uninstall_all() {
   fi
   rm -f "$SBOX_BIN" "$SBOX_SELF"
   rm -rf "$CONF_DIR"
-  CACHE_SBVER="" CACHE_SBVER_MT="" CACHE_IP="" CACHE_NC="" CACHE_NC_MT=""
+  CACHE_SBVER="" CACHE_SBVER_MT="" CACHE_NC="" CACHE_NC_MT="" IP_LINE=""
   ok "已卸载"
 }
 
@@ -1580,7 +1579,6 @@ main_menu() {
 main() {
   need_root
   detect_os
-  ensure_deps
   main_menu
 }
 
