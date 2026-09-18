@@ -343,38 +343,59 @@ ensure_deps() {
   fi
 }
 
-# 跟 free -h / df -h 同一套数；内存/硬盘的 总/已/剩 按列对齐
-_cap_strip3() {
-  awk '{
-    t=$1; u=$2; a=$3
-    gsub(/iB/, "", t); gsub(/i/, "", t)
-    gsub(/iB/, "", u); gsub(/i/, "", u)
-    gsub(/iB/, "", a); gsub(/i/, "", a)
-    print t, u, a
+# 十进制容量（1000 进制）；原始字节重算；统一 1 位小数 + KB/MB/GB 后缀
+_fmt_bytes_dec() {
+  awk -v b="${1:-0}" 'BEGIN {
+    if (b + 0 < 0) b = 0
+    # 数字与单位无空格：cap_lines 用 read 按空格拆「总/已/剩」三列
+    split("B KB MB GB TB PB", u, " ")
+    x = b + 0; i = 1
+    while (x >= 1000 && i < 6) { x /= 1000; i++ }
+    if (i == 1) {
+      printf "%d%s", int(x + 0.5), u[i]
+      exit
+    }
+    # 1 位小数四舍五入后到 1000.0 时进位，避免 "1000.0KB"
+    r = int(x * 10 + 0.5) / 10
+    if (r >= 1000 && i < 6) { r /= 1000; i++ }
+    printf "%.1f%s", r, u[i]
   }'
 }
 
 mem_nums() {
-  local line
-  line=$(free -h 2>/dev/null | awk '/^Mem:/{print $2,$3,(NF>=7?$7:$4)}')
+  local line t u a
+  # free -b: total used free shared buff/cache available
+  # available 缺失或为 0 时退回 free，避免 BusyBox/异常环境把「剩」打成 0B
+  line=$(free -b 2>/dev/null | awk '/^Mem:/{
+    t=$2; u=$3; a=(NF>=7?$7:$4)
+    if (a+0<=0) a=$4
+    printf "%.0f %.0f %.0f", t, u, a
+  }')
   if [[ -z "$line" ]]; then
+    # /proc/meminfo 单位是 KiB
     line=$(awk '
-      /^MemTotal:/{t=$2}
-      /^MemAvailable:/{a=$2}
-      /^MemFree:/{f=$2}
+      /^MemTotal:/{t=$2*1024}
+      /^MemAvailable:/{a=$2*1024}
+      /^MemFree:/{f=$2*1024}
       END{
-        if (a=="") a=f
-        printf "%dM %dM %dM", int(t/1024+0.5), int((t-a)/1024+0.5), int(a/1024+0.5)
+        if (a+0<=0) a=f
+        printf "%.0f %.0f %.0f", t, t-a, a
       }' /proc/meminfo)
   fi
-  printf '%s' "$line" | _cap_strip3
+  read -r t u a <<< "$line"
+  printf '%s %s %s' "$(_fmt_bytes_dec "$t")" "$(_fmt_bytes_dec "$u")" "$(_fmt_bytes_dec "$a")"
 }
 
 disk_nums() {
-  local line
-  line=$(df -hP / 2>/dev/null | awk 'NR==2{print $2,$3,$4}')
-  [[ -z "$line" ]] && line=$(df -h / 2>/dev/null | awk 'NR==2{print $2,$3,$4}')
-  printf '%s' "$line" | _cap_strip3
+  local line t u a
+  # GNU: df -B1 -P；BusyBox 无 -B，走 -k 回退（1K-blocks = 1024 字节）
+  line=$(df -B1 -P / 2>/dev/null | awk 'NR==2 && $2+0>0 {print $2,$3,$4}')
+  if [[ -z "$line" ]]; then
+    line=$(df -kP / 2>/dev/null | awk 'NR==2{printf "%.0f %.0f %.0f", $2*1024, $3*1024, $4*1024}')
+  fi
+  [[ -z "$line" ]] && line=$(df -k / 2>/dev/null | awk 'NR==2{printf "%.0f %.0f %.0f", $2*1024, $3*1024, $4*1024}')
+  read -r t u a <<< "$line"
+  printf '%s %s %s' "$(_fmt_bytes_dec "$t")" "$(_fmt_bytes_dec "$u")" "$(_fmt_bytes_dec "$a")"
 }
 
 cap_lines() {
