@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# deb-tune.sh — Debian 专用网络/内核调优（drop-in 写入，可一键回滚）
-# 运行方式：bash deb-tune.sh（需 root）
+# bbr.sh — Debian 专用网络/内核调优（drop-in 写入，可一键回滚）
+# 运行方式：bash bbr.sh（需 root）
 if [ -z "${BASH_VERSION:-}" ]; then echo "[ERROR] 请用 bash 运行: bash $0" >&2; exit 1; fi
 set -euo pipefail
 
@@ -49,7 +49,7 @@ apt-get update -y >/dev/null 2>&1 || true
 # ---- sysctl drop-in ----
 SYSCTL_FILE=/etc/sysctl.d/99-tuning.conf
 cat > "$SYSCTL_FILE" <<EOF
-# 由 deb-tune.sh 生成于 $(date '+%F %T')
+# 由 bbr.sh 生成于 $(date '+%F %T')
 vm.swappiness = 1
 fs.file-max = $fs_file_max
 
