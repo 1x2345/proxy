@@ -1,11 +1,11 @@
 ### 安装命令
 
-**sing-box**
+**sbox**
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/1x2345/proxy/refs/heads/main/shell/sing-box.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/1x2345/proxy/refs/heads/main/shell/sbox.sh)
 ```
 
-**deb-tune**
+**bbr**
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/1x2345/proxy/refs/heads/main/shell/deb-tune.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/1x2345/proxy/refs/heads/main/shell/bbr.sh)
 ```
