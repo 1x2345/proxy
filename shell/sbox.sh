@@ -343,21 +343,22 @@ ensure_deps() {
   fi
 }
 
-# 十进制容量（1000 进制）；原始字节重算；统一 1 位小数 + KB/MB/GB 后缀
-_fmt_bytes_dec() {
+# 二进制容量（1024 进制）；原始字节重算；统一 1 位小数 + KiB/MiB/GiB
+# 与 free -h / df -h 同一把尺，方便 SSH 对表
+_fmt_bytes_bin() {
   awk -v b="${1:-0}" 'BEGIN {
     if (b + 0 < 0) b = 0
     # 数字与单位无空格：cap_lines 用 read 按空格拆「总/已/剩」三列
-    split("B KB MB GB TB PB", u, " ")
+    split("B KiB MiB GiB TiB PiB", u, " ")
     x = b + 0; i = 1
-    while (x >= 1000 && i < 6) { x /= 1000; i++ }
+    while (x >= 1024 && i < 6) { x /= 1024; i++ }
     if (i == 1) {
       printf "%d%s", int(x + 0.5), u[i]
       exit
     }
-    # 1 位小数四舍五入后到 1000.0 时进位，避免 "1000.0KB"
+    # 1 位小数四舍五入后到 1024.0 时进位，避免 "1024.0KiB"
     r = int(x * 10 + 0.5) / 10
-    if (r >= 1000 && i < 6) { r /= 1000; i++ }
+    if (r >= 1024 && i < 6) { r /= 1024; i++ }
     printf "%.1f%s", r, u[i]
   }'
 }
@@ -383,7 +384,7 @@ mem_nums() {
       }' /proc/meminfo)
   fi
   read -r t u a <<< "$line"
-  printf '%s %s %s' "$(_fmt_bytes_dec "$t")" "$(_fmt_bytes_dec "$u")" "$(_fmt_bytes_dec "$a")"
+  printf '%s %s %s' "$(_fmt_bytes_bin "$t")" "$(_fmt_bytes_bin "$u")" "$(_fmt_bytes_bin "$a")"
 }
 
 disk_nums() {
@@ -395,7 +396,7 @@ disk_nums() {
   fi
   [[ -z "$line" ]] && line=$(df -k / 2>/dev/null | awk 'NR==2{printf "%.0f %.0f %.0f", $2*1024, $3*1024, $4*1024}')
   read -r t u a <<< "$line"
-  printf '%s %s %s' "$(_fmt_bytes_dec "$t")" "$(_fmt_bytes_dec "$u")" "$(_fmt_bytes_dec "$a")"
+  printf '%s %s %s' "$(_fmt_bytes_bin "$t")" "$(_fmt_bytes_bin "$u")" "$(_fmt_bytes_bin "$a")"
 }
 
 cap_lines() {
@@ -408,8 +409,8 @@ cap_lines() {
   (( wt < 4 )) && wt=4
   (( wu < 4 )) && wu=4
   (( wa < 4 )) && wa=4
-  CAP_MEM="总 $(pad_r "$mt" "$wt")  已 $(pad_r "$mu" "$wu")  剩 $(pad_r "$ma" "$wa")"
-  CAP_DISK="总 $(pad_r "$dt" "$wt")  已 $(pad_r "$du" "$wu")  剩 $(pad_r "$da" "$wa")"
+  CAP_MEM="总$(pad_r "$mt" "$wt")  已$(pad_r "$mu" "$wu")  剩$(pad_r "$ma" "$wa")"
+  CAP_DISK="总$(pad_r "$dt" "$wt")  已$(pad_r "$du" "$wu")  剩$(pad_r "$da" "$wa")"
 }
 
 cpu_line() {
